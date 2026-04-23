@@ -1,0 +1,345 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  CUSTOMER
+  SELLER
+  PARTNER_OWNER
+  PARTNER_STAFF
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING         // 주문 접수
+  CALLING         // 콜 발송 중
+  ACCEPTED        // 가맹점 수락
+  IN_PROGRESS     // 작업 중
+  DELIVERING      // 배송 중
+  DELIVERED       // 배송 완료
+  CONFIRMED       // 고객 확인
+  CANCELLED       // 취소
+  REDISPATCHED    // 타 지역 재발주됨
+}
+
+enum SettlementType {
+  SETTLEMENT    // 정산 (D+1)
+  INSTANT       // 즉시출금
+  WITHDRAWAL    // 출금
+}
+
+enum SettlementStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+enum WalletTransactionType {
+  CHARGE        // 충전
+  EARN          // 수익 적립
+  SPEND         // 사용
+  WITHDRAW      // 출금
+}
+
+model User {
+  id            String    @id @default(cuid())
+  role          UserRole
+  name          String
+  phone         String    @unique
+  email         String?   @unique
+  passwordHash  String
+  businessName  String?   // 화원명 (파트너용)
+  address       String?   // 화원 주소
+  lat           Float?    // 위도
+  lng           Float?    // 경도
+  region        String?   // 지역 코드
+  isApproved    Boolean   @default(false) // 가맹점 승인 여부
+  isActive      Boolean   @default(true)
+  refreshToken  String?
+  pushToken     String?   // Expo 푸시 토큰
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // 셀러 전용
+  referralCode  String?   @unique
+  referredBy    String?   // 추천인 셀러 ID
+
+  // 직원 전용 (PARTNER_STAFF)
+  ownerId       String?   // 소속 화원 사장 ID
+  owner         User?     @relation("StaffOwner", fields: [ownerId], references: [id])
+  staff         User[]    @relation("StaffOwner")
+
+  ordersAsCustomer  Order[]        @relation("CustomerOrders")
+  ordersAsPartner   Order[]        @relation("PartnerOrders")
+  settlements       Settlement[]
+  wallet            Wallet?
+  logs              Log[]
+  callReceives      CallReceive[]
+  supplyOrders      SupplyOrder[]
+  sellerProfile     SellerProfile?
+  sellerCommissions SellerCommission[]
+  referralClicks    SellerReferralClick[]
+
+  @@index([role])
+  @@index([region])
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique @default(cuid())
+  customerId      String
+  partnerId       String?
+  sellerId        String?     // 유치한 셀러
+
+  // 배송 정보
+  recipientName   String
+  recipientPhone  String
+  deliveryAddress String
+  deliveryLat     Float?
+  deliveryLng     Float?
+  deliveryRegion  String
+
+  // 상품 정보
+  productName     String      @default("근조화환")
+  price           Int         // 원 단위
+  memo            String?
+
+  status          OrderStatus @default(PENDING)
+
+  // 완료 사진
+  completionPhoto String?
+
+  // 수익 분배
+  sellerAmount    Int?        // 셀러 수익 (15%)
+  partnerAmount   Int?        // 화원 정산 (56%)
+  platformAmount  Int?        // 플랫폼 (잔여)
+  pgFee           Int?        // PG 수수료 (3.3%)
+
+  scheduledAt     DateTime?   // 배달 희망 시간
+  acceptedAt      DateTime?
+  deliveredAt     DateTime?
+  confirmedAt     DateTime?
+  cancelledAt     DateTime?
+
+  // 재발주 연결 (타 지역 발주 시)
+  parentOrderId   String?     // 원본 주문 ID (재발주된 주문인 경우)
+  redispatchNote  String?     // 재발주 사유/메모
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  customer        User        @relation("CustomerOrders", fields: [customerId], references: [id])
+  partner         User?       @relation("PartnerOrders", fields: [partnerId], references: [id])
+  settlements       Settlement[]
+  callReceives      CallReceive[]
+  payment           Payment?
+  sellerCommission  SellerCommission?
+  parentOrder       Order?    @relation("RedispatchChain", fields: [parentOrderId], references: [id])
+  childOrders       Order[]   @relation("RedispatchChain")
+
+  @@index([status])
+  @@index([deliveryRegion])
+  @@index([customerId])
+  @@index([partnerId])
+  @@index([createdAt])
+}
+
+model CallReceive {
+  id        String   @id @default(cuid())
+  orderId   String
+  partnerId String
+  status    String   @default("PENDING") // PENDING | ACCEPTED | REJECTED | EXPIRED
+  sentAt    DateTime @default(now())
+  respondedAt DateTime?
+
+  order     Order    @relation(fields: [orderId], references: [id])
+  partner   User     @relation(fields: [partnerId], references: [id])
+
+  @@unique([orderId, partnerId])
+  @@index([orderId])
+  @@index([partnerId])
+}
+
+model Settlement {
+  id        String            @id @default(cuid())
+  userId    String
+  orderId   String?
+  amount    Int               // 원 단위
+  fee       Int               @default(0) // 즉시출금 수수료
+  netAmount Int               // 실지급액
+  type      SettlementType
+  status    SettlementStatus  @default(PENDING)
+  memo      String?
+  settledAt DateTime?
+  createdAt DateTime          @default(now())
+
+  user      User              @relation(fields: [userId], references: [id])
+  order     Order?            @relation(fields: [orderId], references: [id])
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Wallet {
+  id        String    @id @default(cuid())
+  userId    String    @unique
+  balance   Int       @default(0) // 앱머니 잔액 (원)
+  updatedAt DateTime  @updatedAt
+
+  user         User               @relation(fields: [userId], references: [id])
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id        String                @id @default(cuid())
+  walletId  String
+  amount    Int
+  type      WalletTransactionType
+  memo      String?
+  createdAt DateTime              @default(now())
+
+  wallet    Wallet                @relation(fields: [walletId], references: [id])
+
+  @@index([walletId])
+}
+
+model SupplyProduct {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  category    String   // 꽃, 오아시스, 리본, 포장재, 기타
+  unit        String   // 개, 묶음, 박스
+  price       Int      // 앱머니 가격
+  stock       Int      @default(0)
+  imageUrl    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  orders      SupplyOrder[]
+
+  @@index([category])
+  @@index([isActive])
+}
+
+model SupplyOrder {
+  id          String   @id @default(cuid())
+  buyerId     String
+  productId   String
+  quantity    Int
+  unitPrice   Int
+  totalPrice  Int
+  status      String   @default("PENDING") // PENDING | CONFIRMED | SHIPPED | DELIVERED | CANCELLED
+  address     String?
+  memo        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  buyer       User             @relation(fields: [buyerId], references: [id])
+  product     SupplyProduct    @relation(fields: [productId], references: [id])
+
+  @@index([buyerId])
+  @@index([status])
+}
+
+model Payment {
+  id            String    @id @default(cuid())
+  orderId       String    @unique
+  tossOrderId   String    @unique  // 토스에 전달하는 주문번호
+  amount        Int
+  paymentKey    String?   @unique  // 토스 결제키 (확인 후 발급)
+  method        String?           // 카드, 계좌이체, 가상계좌 등
+  status        String    @default("READY") // READY | DONE | CANCELLED | ABORTED | EXPIRED
+  cancelReason  String?
+  receiptUrl    String?
+  approvedAt    DateTime?
+  cancelledAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  order         Order     @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// 셀러 프로필 (User.role=SELLER 인 경우 1:1)
+model SellerProfile {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  referralCode          String   @unique  // 추천 코드 (예: SELLER_A1B2)
+  referralLink          String?           // 전체 URL
+  totalCommissionEarned Int      @default(0)  // 누적 수수료 합계
+  totalCommissionPaid   Int      @default(0)  // 지급 완료 합계
+  pendingCommission     Int      @default(0)  // 미지급 잔액
+  status                String   @default("ACTIVE") // ACTIVE | INACTIVE | SUSPENDED
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user                  User     @relation(fields: [userId], references: [id])
+
+  @@index([referralCode])
+  @@index([status])
+}
+
+// 셀러 수수료 내역 (주문별 1:1)
+model SellerCommission {
+  id               String   @id @default(cuid())
+  sellerId         String
+  orderId          String   @unique
+  commissionAmount Int      // 주문금액 × 15%
+  status           String   @default("PENDING") // PENDING | PAID | CANCELLED
+  paidAt           DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime @default(now())
+
+  seller           User     @relation(fields: [sellerId], references: [id])
+  order            Order    @relation(fields: [orderId], references: [id])
+
+  @@index([sellerId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// 셀러 추천 링크 클릭 추적
+model SellerReferralClick {
+  id          String   @id @default(cuid())
+  sellerId    String
+  clickedAt   DateTime @default(now())
+  ipAddress   String?
+  userAgent   String?
+  converted   Boolean  @default(false) // 주문 전환 여부
+  orderId     String?                  // 전환된 경우 주문 ID
+
+  seller      User     @relation(fields: [sellerId], references: [id])
+
+  @@index([sellerId])
+  @@index([clickedAt])
+}
+
+model Log {
+  id        String   @id @default(cuid())
+  userId    String?
+  action    String
+  detail    Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model SystemConfig {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
